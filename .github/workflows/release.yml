@@ -1,0 +1,90 @@
+# Builds RifeGapfill-<tag>.exe and publishes a GitHub release.
+#
+#   git tag v2.2 && git push origin v2.2
+#
+# 1. test:    renders the synthetic test clips and checks detection (Linux)
+# 2. build:   PyInstaller one-file exe (Windows)
+# 3. release: creates the release for the tag, notes from docs/releases/<tag>.md,
+#             exe attached, SHA-256 appended
+#
+# Run it by hand (Actions > Release > Run workflow) to get a test build as a
+# workflow artifact without publishing anything.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ffmpeg and Python packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          pip install numpy pillow opencv-python-headless
+      - name: Render test clips
+        working-directory: tests
+        run: python make_tests.py clips
+      - name: Check detection
+        working-directory: tests
+        run: python evaluate.py --check clean random periodic
+
+  build:
+    needs: test
+    runs-on: windows-latest
+    outputs:
+      name: ${{ steps.build.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python packages
+        run: pip install pyinstaller numpy pillow opencv-python-headless
+      - name: Build exe
+        id: build
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "dev-${{ github.run_number }}" }
+          $name = "RifeGapfill-$tag"
+          pyinstaller --onefile --windowed --name $name gapfill_gui.py
+          if (-not (Test-Path "dist/$name.exe")) { throw "build failed: dist/$name.exe missing" }
+          $hash = (Get-FileHash "dist/$name.exe" -Algorithm SHA256).Hash.ToLower()
+          $notes = "docs/releases/$tag.md"
+          $body = if (Test-Path $notes) { Get-Content $notes -Raw } else { "" }
+          $body = $body.TrimEnd() + "`n`nSHA-256 of ``$name.exe``: ``$hash``"
+          Set-Content -Path release-notes.md -Value $body -Encoding utf8
+          "name=$name" >> $env:GITHUB_OUTPUT
+          Write-Host "$name.exe  $hash"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.name }}
+          path: |
+            dist/${{ steps.build.outputs.name }}.exe
+            release-notes.md
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.name }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: RIFE Gapfill ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: dist/${{ needs.build.outputs.name }}.exe
+          make_latest: true

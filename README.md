@@ -142,6 +142,19 @@ python rife_gapfill.py clip.mov --out-fps keep --prores 4444
 | `--steps-csv file` | Per-step measurements, for checking against Resolve |
 | `--rife`, `--model`, `--ffmpeg`, `--ffprobe` | Tool paths if not found automatically |
 
+## Releases
+
+Releases are built on GitHub. Pushing a version tag runs
+`.github/workflows/release.yml`: the synthetic test clips are rendered and
+checked on Linux, the exe is built with PyInstaller on Windows, and a release
+is published with the notes from `docs/releases/<tag>.md`, the exe and its
+SHA-256.
+
+```
+git tag v2.2
+git push origin v2.2
+```
+
 ## Tests
 
 ```
