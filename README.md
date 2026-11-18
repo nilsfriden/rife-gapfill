@@ -81,8 +81,10 @@ Audio is not carried over.
 
 - Windows for the GUI and RIFE binary. The core script also runs on Linux
   and macOS.
-- [ffmpeg + ffprobe](https://ffmpeg.org/) (`winget install Gyan.FFmpeg`).
-  Found automatically on PATH, next to the exe, or in the WinGet folder.
+- [ffmpeg + ffprobe](https://ffmpeg.org/). The GUI can download them
+  (Gyan's release essentials build), or use `winget install Gyan.FFmpeg`.
+  Found automatically next to the exe, in the folder above it, on PATH or in
+  the WinGet folder.
 - [rife-ncnn-vulkan](https://github.com/nihui/rife-ncnn-vulkan/releases).
   Runs on any GPU through Vulkan. The GUI can download it. A v4 model
   (default `rife-v4.6`) is needed to fill gaps of more than one frame.
@@ -116,8 +118,9 @@ pip install pyinstaller numpy pillow opencv-python-headless
 pyinstaller --onefile --windowed --name RifeGapfill gapfill_gui.py
 ```
 
-Copy `dist\RifeGapfill.exe` next to the `rife-ncnn-vulkan-…-windows` folder,
-or use **Download…** in the GUI.
+Add the version to `--name` (e.g. `RifeGapfill-v2.1`) to get a versioned exe.
+The exe finds RIFE and ffmpeg next to itself or in the folder above it (so
+running from `dist\` works), or use the **Download…** buttons in the GUI.
 
 ## Command line
 

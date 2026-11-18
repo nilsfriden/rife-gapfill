@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-gapfill_gui.py  v2.0  -  GUI for rife_gapfill (core v2.0+)
+gapfill_gui.py  v2.1  -  GUI for rife_gapfill (core v2.0+)
 
 Finds missing and repeated frames, lets you review them, and renders an even
 cadence with missing frames interpolated by RIFE.
@@ -13,6 +13,9 @@ rife-ncnn-vulkan folder (or use Download… in the GUI). Settings are saved in
 %APPDATA%\\RifeGapfill\\settings.json.
 
 Changes
+  2.1  Download button for ffmpeg (Gyan's release essentials build; only
+       ffmpeg.exe and ffprobe.exe are kept). One startup offer for whichever
+       tools are missing. Tools are also found when running from dist.
   2.0  Review panel: motion timeline, event list with tick boxes, thumbnails
        before/after each event; repeats and random gaps; detection settings
        for the v2 core; re-classify from cached measurements; two-column
@@ -39,11 +42,13 @@ from PIL import Image
 
 import rife_gapfill as core
 
-GUI_VERSION = "2.0"
+GUI_VERSION = "2.1"
 
 RIFE_API = "https://api.github.com/repos/nihui/rife-ncnn-vulkan/releases/latest"
 RIFE_FALLBACK = ("https://github.com/nihui/rife-ncnn-vulkan/releases/download/"
                  "20221029/rife-ncnn-vulkan-20221029-windows.zip")
+FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+FFMPEG_MIRROR_API = "https://api.github.com/repos/GyanD/codexffmpeg/releases/latest"
 UA = {"User-Agent": f"RifeGapfill/{GUI_VERSION}"}
 
 FPS_CHOICES = {
@@ -93,7 +98,9 @@ HELP = {
     "rife": "Path to rife-ncnn-vulkan.exe. Found automatically when it sits next to this program.",
     "download": "Download the latest rife-ncnn-vulkan for Windows from GitHub (nihui/rife-ncnn-vulkan) and set it up. A few hundred MB.",
     "model": "RIFE model. rife-v4.6 is the newest and usually the best. A v4 model is needed to fill gaps of more than one frame.",
-    "ffmpeg": "Path to ffmpeg.exe. ffprobe.exe must be in the same folder. Found automatically on PATH or in the WinGet install folder.",
+    "ffmpeg": "Path to ffmpeg.exe. ffprobe.exe must be in the same folder. Found automatically on PATH, in the WinGet install folder, or where Download… put it.",
+    "download_ffmpeg": ("Download ffmpeg and ffprobe (Gyan's release essentials build for Windows, about 110 MB) and set them up. "
+                        "Only ffmpeg.exe and ffprobe.exe are kept, in an 'ffmpeg' folder next to this program."),
     "browse": "Choose the file or folder.",
     "gap_ratio": ("How much longer than expected a frame step must be to count as a gap. 2.0 means exactly one "
                   "frame missing; the default 1.5 sits halfway. Lower finds more but risks false hits."),
@@ -122,26 +129,17 @@ HELP = {
 }
 
 
-# ------------------------------------------------------------------ RIFE download
+# ------------------------------------------------------------------ tool downloads
 
-def local_tools_dir():
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    return os.path.join(base, "RifeGapfill")
-
-
-def rife_exe_name():
-    return "rife-ncnn-vulkan" + (".exe" if os.name == "nt" else "")
+def exe_name(name):
+    return name + (".exe" if os.name == "nt" else "")
 
 
 def find_rife():
-    p = core.find_tool("rife-ncnn-vulkan")
-    if p:
-        return p
-    hits = sorted(glob.glob(os.path.join(local_tools_dir(), "rife-ncnn-vulkan*", rife_exe_name())))
-    return hits[-1] if hits else ""
+    return core.find_tool("rife-ncnn-vulkan")
 
 
-def rife_download_dir():
+def download_dir():
     """Next to the exe/script if writable, else %LOCALAPPDATA%\\RifeGapfill."""
     d = core.app_dir()
     try:
@@ -151,59 +149,120 @@ def rife_download_dir():
         os.remove(probe)
         return d
     except OSError:
-        os.makedirs(local_tools_dir(), exist_ok=True)
-        return local_tools_dir()
+        os.makedirs(core.tools_dir(), exist_ok=True)
+        return core.tools_dir()
 
 
-def rife_release_asset():
-    """Return (name, url, size) of the latest Windows zip."""
+def github_asset(api, suffix):
+    """(name, url, size) of the first asset ending with suffix in a GitHub release, or None."""
     try:
-        req = urllib.request.Request(RIFE_API, headers={**UA, "Accept": "application/vnd.github+json"})
+        req = urllib.request.Request(api, headers={**UA, "Accept": "application/vnd.github+json"})
         with urllib.request.urlopen(req, timeout=20) as r:
             rel = json.load(r)
         for a in rel.get("assets", []):
-            if a["name"].endswith("-windows.zip"):
+            if a["name"].endswith(suffix):
                 return a["name"], a["browser_download_url"], int(a.get("size") or 0)
     except Exception:
         pass
-    return os.path.basename(RIFE_FALLBACK), RIFE_FALLBACK, 0
+    return None
+
+
+def fetch(url, path, log, progress, cancel, size=0):
+    """Download url to path with progress; returns bytes downloaded."""
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=30) as r, open(path, "wb") as f:
+        total = int(r.headers.get("Content-Length") or size or 0)
+        got = 0
+        while True:
+            if cancel():
+                raise core.Cancelled()
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+            got += len(chunk)
+            progress(got, total or got)
+    log(f"  {got / 1e6:.0f} MB downloaded")
+    return got
+
+
+def safe_members(z, dest):
+    """Zip members, refusing any path that would land outside dest."""
+    root = os.path.realpath(dest)
+    for m in z.infolist():
+        target = os.path.realpath(os.path.join(dest, m.filename))
+        if not (target == root or target.startswith(root + os.sep)):
+            raise core.GapfillError(f"unsafe path in zip: {m.filename}")
+    return z.infolist()
 
 
 def download_rife(dest, log, progress, cancel):
-    name, url, size = rife_release_asset()
+    found = github_asset(RIFE_API, "-windows.zip")
+    name, url, size = found or (os.path.basename(RIFE_FALLBACK), RIFE_FALLBACK, 0)
     log(f"Downloading {name}")
     log(f"  from {url}")
     part = os.path.join(dest, name + ".part")
-    req = urllib.request.Request(url, headers=UA)
     try:
-        with urllib.request.urlopen(req, timeout=30) as r, open(part, "wb") as f:
-            total = int(r.headers.get("Content-Length") or size or 0)
-            got = 0
-            while True:
-                if cancel():
-                    raise core.Cancelled()
-                chunk = r.read(1 << 20)
-                if not chunk:
-                    break
-                f.write(chunk)
-                got += len(chunk)
-                progress(got, total or got)
-        log(f"  {got / 1e6:.0f} MB downloaded, extracting ...")
-        root = os.path.realpath(dest)
+        fetch(url, part, log, progress, cancel, size)
+        log("  extracting ...")
         with zipfile.ZipFile(part) as z:
-            for m in z.infolist():          # refuse paths escaping dest
-                target = os.path.realpath(os.path.join(dest, m.filename))
-                if not (target == root or target.startswith(root + os.sep)):
-                    raise core.GapfillError(f"unsafe path in zip: {m.filename}")
+            safe_members(z, dest)
             z.extractall(dest)
     finally:
         if os.path.exists(part):
             os.remove(part)
-    hits = sorted(glob.glob(os.path.join(dest, "rife-ncnn-vulkan*", rife_exe_name())))
+    hits = sorted(glob.glob(os.path.join(dest, "rife-ncnn-vulkan*", exe_name("rife-ncnn-vulkan"))))
     if not hits:
         raise core.GapfillError("download finished but rife-ncnn-vulkan.exe was not found")
     log(f"  RIFE ready: {hits[-1]}")
     return hits[-1]
+
+
+def download_ffmpeg(dest, log, progress, cancel):
+    """Gyan's release essentials build; only ffmpeg.exe and ffprobe.exe are kept,
+    in <dest>\\ffmpeg\\."""
+    sources = [("ffmpeg-release-essentials.zip", FFMPEG_URL, 0)]
+    mirror = github_asset(FFMPEG_MIRROR_API, "essentials_build.zip")
+    if mirror:
+        sources.append(mirror)
+    out_dir = os.path.join(dest, "ffmpeg")
+    last = None
+    for name, url, size in sources:
+        log(f"Downloading {name}")
+        log(f"  from {url}")
+        part = os.path.join(dest, "ffmpeg-download.zip.part")
+        try:
+            fetch(url, part, log, progress, cancel, size)
+            log("  extracting ffmpeg.exe and ffprobe.exe ...")
+            os.makedirs(out_dir, exist_ok=True)
+            wanted = {exe_name("ffmpeg"), exe_name("ffprobe"), "LICENSE", "LICENSE.txt"}
+            got = set()
+            with zipfile.ZipFile(part) as z:
+                for m in safe_members(z, dest):
+                    base = os.path.basename(m.filename)
+                    parent = os.path.basename(os.path.dirname(m.filename))
+                    if base in wanted and (parent == "bin" or base.startswith("LICENSE")) and not m.is_dir():
+                        with z.open(m) as src, open(os.path.join(out_dir, base), "wb") as dst:
+                            while True:
+                                b = src.read(1 << 20)
+                                if not b:
+                                    break
+                                dst.write(b)
+                        got.add(base)
+            if exe_name("ffmpeg") in got and exe_name("ffprobe") in got:
+                path = os.path.join(out_dir, exe_name("ffmpeg"))
+                log(f"  ffmpeg ready: {path}")
+                return path
+            last = core.GapfillError("ffmpeg.exe / ffprobe.exe not found in the download")
+        except core.Cancelled:
+            raise
+        except Exception as e:
+            last = e
+            log(f"  failed: {e}")
+        finally:
+            if os.path.exists(part):
+                os.remove(part)
+    raise core.GapfillError(f"ffmpeg download failed: {last}")
 
 
 # ------------------------------------------------------------------ settings
@@ -405,7 +464,10 @@ class App:
         if not os.path.isfile(rife):
             rife = find_rife()
         self.v_rife = tk.StringVar(value=rife)
-        self.v_ffmpeg = tk.StringVar(value=s.get("ffmpeg") or core.find_tool("ffmpeg"))
+        ff = s.get("ffmpeg") or ""
+        if not os.path.isfile(ff):
+            ff = core.find_tool("ffmpeg")
+        self.v_ffmpeg = tk.StringVar(value=ff)
         self.v_model = tk.StringVar(value=s.get("model", "rife-v4.6"))
         self.v_outmode = tk.StringVar(value=s.get("outmode", "source"))
         self.v_outdir = tk.StringVar(value=s.get("outdir", ""))
@@ -429,8 +491,9 @@ class App:
         self.refresh_models()
         self.root.after(100, self.poll)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
-        if not self.v_rife.get():
-            self.root.after(400, lambda: self.offer_rife_download(startup=True))
+        missing = [t for t, v in (("rife", self.v_rife), ("ffmpeg", self.v_ffmpeg)) if not v.get()]
+        if missing:
+            self.root.after(400, lambda: self.offer_download(missing, startup=True))
 
     # ------------------------------------------------------------- layout
     def section(self, parent, row, title, col=0):
@@ -521,7 +584,7 @@ class App:
         ttk.Label(tf, text="RIFE", style="Dim.TLabel").grid(row=0, column=0, sticky="w")
         tip(ttk.Entry(tf, textvariable=self.v_rife, width=10), "rife").grid(row=0, column=1, sticky="ew", padx=(10, 0))
         tip(ttk.Button(tf, text="…", width=3, command=self.pick_rife), "browse").grid(row=0, column=2, padx=(6, 0))
-        self.b_dl = tip(ttk.Button(tf, text="Download…", command=self.offer_rife_download), "download")
+        self.b_dl = tip(ttk.Button(tf, text="Download…", command=lambda: self.offer_download(["rife"])), "download")
         self.b_dl.grid(row=0, column=3, padx=(6, 0))
         ttk.Label(tf, text="Model", style="Dim.TLabel").grid(row=1, column=0, sticky="w", pady=4)
         self.cb_model = tip(ttk.Combobox(tf, textvariable=self.v_model, width=16), "model")
@@ -529,6 +592,9 @@ class App:
         ttk.Label(tf, text="ffmpeg", style="Dim.TLabel").grid(row=2, column=0, sticky="w")
         tip(ttk.Entry(tf, textvariable=self.v_ffmpeg, width=10), "ffmpeg").grid(row=2, column=1, sticky="ew", padx=(10, 0))
         tip(ttk.Button(tf, text="…", width=3, command=self.pick_ffmpeg), "browse").grid(row=2, column=2, padx=(6, 0))
+        self.b_dlff = tip(ttk.Button(tf, text="Download…", command=lambda: self.offer_download(["ffmpeg"])),
+                          "download_ffmpeg")
+        self.b_dlff.grid(row=2, column=3, padx=(6, 0))
 
         # detection
         df = self.section(left, 6, "Detection")
@@ -945,7 +1011,7 @@ class App:
         s = text.strip()
         if "ERROR" in s:
             tag = "err"
-        elif s.startswith("done:") or s.startswith("RIFE ready"):
+        elif s.startswith("done:") or s.startswith("RIFE ready") or s.startswith("ffmpeg ready"):
             tag = "ok"
         elif text and not text.startswith(" "):
             tag = "head"
@@ -1049,36 +1115,45 @@ class App:
             log("")
         self.q.put(("done", None))
 
-    def offer_rife_download(self, startup=False):
+    def offer_download(self, which, startup=False):
         if self.worker and self.worker.is_alive():
             return
-        dest = rife_download_dir()
-        msg = ("RIFE (rife-ncnn-vulkan) was not found.\n\n" if startup else "") + \
-              ("Download the latest Windows release from GitHub (nihui/rife-ncnn-vulkan)?\n"
-               "It is a few hundred MB and includes all models.\n\n"
-               f"It will be unpacked to:\n{dest}")
+        dest = download_dir()
+        names = {"rife": "RIFE (rife-ncnn-vulkan, a few hundred MB, all models)",
+                 "ffmpeg": "ffmpeg + ffprobe (Gyan's release essentials build, about 110 MB)"}
+        msg = ""
+        if startup:
+            msg = "Not found on this computer:\n" + "\n".join("  - " + names[w] for w in which) + "\n\n"
+        msg += ("Download " + (" and ".join(names[w].split(" (")[0] for w in which)) + " now?\n\n"
+                + ("" if startup else names[which[0]] + "\n\n")
+                + f"Saved to:\n{dest}")
         if not messagebox.askyesno("RIFE Gapfill", msg):
             return
         self.cancel_flag.clear()
         self.set_busy(True)
-        self.v_status.set("DOWNLOADING RIFE")
-        self.worker = threading.Thread(target=self.run_download, args=(dest,), daemon=True)
+        self.worker = threading.Thread(target=self.run_download, args=(dest, list(which)), daemon=True)
         self.worker.start()
 
-    def run_download(self, dest):
+    def run_download(self, dest, which):
         log = lambda t: self.q.put(("log", t))
-        try:
-            exe = download_rife(dest, log,
-                                lambda i, t: self.q.put(("progress", (i, t))),
-                                self.cancel_flag.is_set)
-            self.q.put(("rife", exe))
-        except core.Cancelled:
-            log("  download cancelled")
-        except Exception as e:
-            log(f"  ERROR: download failed: {e}")
-            log("  You can download it manually from "
-                "github.com/nihui/rife-ncnn-vulkan/releases and use the … button")
-        log("")
+        prog = lambda i, t: self.q.put(("progress", (i, t)))
+        for w in which:
+            self.q.put(("status", "DOWNLOADING " + ("RIFE" if w == "rife" else "FFMPEG")))
+            try:
+                if w == "rife":
+                    self.q.put(("rife", download_rife(dest, log, prog, self.cancel_flag.is_set)))
+                else:
+                    self.q.put(("ffmpeg", download_ffmpeg(dest, log, prog, self.cancel_flag.is_set)))
+            except core.Cancelled:
+                log("  download cancelled")
+                break
+            except Exception as e:
+                log(f"  ERROR: download failed: {e}")
+                if w == "rife":
+                    log("  Manual download: github.com/nihui/rife-ncnn-vulkan/releases, then use the … button")
+                else:
+                    log("  Manual install: winget install Gyan.FFmpeg, or gyan.dev/ffmpeg/builds")
+            log("")
         self.q.put(("done", None))
 
     def cancel(self):
@@ -1087,7 +1162,7 @@ class App:
 
     def set_busy(self, busy):
         st = "disabled" if busy else "normal"
-        for b in (self.b_an, self.b_go, self.b_dl, self.b_all, self.b_none, self.b_auto):
+        for b in (self.b_an, self.b_go, self.b_dl, self.b_dlff, self.b_all, self.b_none, self.b_auto):
             b.configure(state=st)
         self.b_cancel.configure(state="normal" if busy else "disabled")
 
@@ -1122,6 +1197,9 @@ class App:
                 elif kind == "rife":
                     self.v_rife.set(val)
                     self.refresh_models()
+                    self.save_settings()
+                elif kind == "ffmpeg":
+                    self.v_ffmpeg.set(val)
                     self.save_settings()
                 elif kind == "done":
                     self.set_busy(False)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-rife_gapfill.py  v2.0
+rife_gapfill.py  v2.0.1
 
 Finds missing and repeated frames in a video and rebuilds an even cadence:
 repeated frames are dropped and missing frames are interpolated with RIFE.
@@ -37,6 +37,8 @@ Requirements
     (v4 models are needed to insert more than one frame in a gap)
 
 Changes
+  2.0.1 Tool search also looks in the folder above the exe (running from
+        dist) and in %LOCALAPPDATA%\\RifeGapfill (downloaded tools).
   2.0  New analysis: optical flow + timeline model. Detects random and
        periodic missing frames (1-3 in a row), repeated frames and repeat +
        jump; confidence per event; review support; multi-frame RIFE inserts.
@@ -67,7 +69,7 @@ try:
 except ImportError:  # reported when analysis starts
     cv2 = None
 
-VERSION = "2.0"
+VERSION = "2.0.1"
 
 NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}  # CREATE_NO_WINDOW
 
@@ -131,19 +133,34 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def tools_dir():
+    """Per-user folder for downloaded tools (used when the exe folder is read-only)."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "RifeGapfill")
+
+
 def find_tool(name):
-    """Locate ffmpeg/ffprobe/rife-ncnn-vulkan. Returns path or ''."""
+    """Locate ffmpeg/ffprobe/rife-ncnn-vulkan. Returns path or ''.
+    Looks next to the exe/script, in the folder above it (for dist\\), in the
+    per-user tools folder, on PATH and in the WinGet package folder."""
     exe = name + (".exe" if os.name == "nt" else "")
     base = app_dir()
-    for p in (os.path.join(base, exe), os.path.join(base, "bin", exe)):
-        if os.path.isfile(p):
-            return p
+    roots = [base, os.path.dirname(base), tools_dir()]
+    for r in roots:
+        if name.startswith("rife"):
+            hits = sorted(glob.glob(os.path.join(r, "rife-ncnn-vulkan*", exe)))
+            if hits:
+                return hits[-1]
+        else:
+            for p in (os.path.join(r, exe), os.path.join(r, "bin", exe),
+                      os.path.join(r, "ffmpeg", exe)):
+                if os.path.isfile(p):
+                    return p
     w = shutil.which(name)
     if w:
         return w
     pats = []
     if name.startswith("rife"):
-        pats.append(os.path.join(base, "rife-ncnn-vulkan*", exe))
         pats.append(os.path.join(base, "*", "rife-ncnn-vulkan*", exe))
     else:
         la = os.environ.get("LOCALAPPDATA")
