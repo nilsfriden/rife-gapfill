@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
 """
-gapfill_gui.py  v1.3  -  GUI for rife_gapfill (v1.1+)
+gapfill_gui.py  v2.0  -  GUI for rife_gapfill (core v2.0+)
+
+Finds missing and repeated frames, lets you review them, and renders an even
+cadence with missing frames interpolated by RIFE.
 
 Build a Windows exe (run in the folder containing both .py files):
-    pip install pyinstaller numpy pillow
+    pip install pyinstaller numpy pillow opencv-python-headless
     pyinstaller --onefile --windowed --name RifeGapfill gapfill_gui.py
 The exe ends up in dist\\RifeGapfill.exe. Put it next to the
-rife-ncnn-vulkan folder (or point to RIFE in the GUI). Settings are saved in
+rife-ncnn-vulkan folder (or use Download… in the GUI). Settings are saved in
 %APPDATA%\\RifeGapfill\\settings.json.
 
 Changes
-  1.3  Help text shown in a fixed panel inside the window instead of
-       floating tooltips.
-  1.2  Dark theme in Nils-Player style (graphite, orange accent, Consolas),
-       hover help on every control, dark Windows title bar, high-DPI aware,
-       coloured log.
-  1.1  Download button for rife-ncnn-vulkan (latest Windows release from
-       GitHub); offered automatically when RIFE is not found at startup.
+  2.0  Review panel: motion timeline, event list with tick boxes, thumbnails
+       before/after each event; repeats and random gaps; detection settings
+       for the v2 core; re-classify from cached measurements; two-column
+       layout.
+  1.3  Help text shown in a fixed panel inside the window.
+  1.2  Dark theme in Nils-Player style, dark title bar, high-DPI aware.
+  1.1  Download button for rife-ncnn-vulkan.
   1.0  First version.
 """
 
+import base64
 import glob
+import io
 import json
 import os
 import queue
@@ -30,9 +35,11 @@ import zipfile
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from PIL import Image
+
 import rife_gapfill as core
 
-GUI_VERSION = "1.3"
+GUI_VERSION = "2.0"
 
 RIFE_API = "https://api.github.com/repos/nihui/rife-ncnn-vulkan/releases/latest"
 RIFE_FALLBACK = ("https://github.com/nihui/rife-ncnn-vulkan/releases/download/"
@@ -40,8 +47,8 @@ RIFE_FALLBACK = ("https://github.com/nihui/rife-ncnn-vulkan/releases/download/"
 UA = {"User-Agent": f"RifeGapfill/{GUI_VERSION}"}
 
 FPS_CHOICES = {
-    "Same as source (longer clip)": "same",
-    "Restore original duration": "restore",
+    "Same as source (even cadence)": "same",
+    "Keep original duration": "keep",
     "Custom": "custom",
 }
 PRORES_CHOICES = {"ProRes 422": "422", "ProRes 422 HQ": "hq", "ProRes 4444": "4444"}
@@ -56,50 +63,62 @@ TRACK = "#3A3A3A"
 TEXT = "#E6E6E6"
 DIM = "#8A8A8A"
 DIMMER = "#5A5A5A"
-ACCENT = "#FF9B2E"   # orange
+ACCENT = "#FF9B2E"   # orange: missing frames
 ACCENT_HI = "#FFB25C"
+REPEAT = "#4FB3FF"   # blue: repeated frames
 ERR = "#FF6B5A"
 FONT_FAMILY = "Consolas"
 FONT = (FONT_FAMILY, 9)
 FONT_B = (FONT_FAMILY, 9, "bold")
+THUMB_W = 240
 
 
 HELP = {
-    "add": "Add one or more video files. All clips in the list are processed in turn with the same settings.",
+    "add": "Add one or more video files. All clips in the list are analysed and rendered with the same settings.",
     "remove": "Remove the selected clips from the list.",
     "clear": "Empty the list.",
-    "files": "Clips to process. Select several with Ctrl or Shift.",
+    "files": "Clips to process. Select a clip to show its events in the review panel on the right.",
     "out_source": "Write each result in the same folder as its source clip.",
-    "out_folder": "Write all results to the folder below.",
+    "out_folder": "Write all results to the folder next to this option.",
     "outdir": "Output folder used when 'Folder' is selected.",
-    "fps": ("Frame rate of the output file.\n\n"
-            "Same as source: keeps the source rate. One frame is added per gap, so the clip gets longer.\n\n"
-            "Restore original duration: raises the rate by (period+1)/period so the duration stays the same, "
-            "e.g. 24 -> 25 fps for a gap every 24 frames.\n\n"
+    "fps": ("Frame rate of the output file.\n"
+            "Same as source: an even cadence at the source rate. Missing frames make the clip longer, "
+            "dropped repeats make it shorter.\n"
+            "Keep original duration: the rate is adjusted so the duration stays the same, "
+            "e.g. 24 -> 25 fps when one frame in 24 was missing.\n"
             "Custom: any rate you type."),
     "fps_custom": "Output frame rate for 'Custom', e.g. 24, 25 or 23.976.",
-    "codec": ("ProRes 422: smaller files.\nProRes 422 HQ: standard for editing and grading.\n"
-              "ProRes 4444: full chroma resolution, largest files.\n\nAudio is not included."),
+    "codec": ("ProRes 422: smaller files. ProRes 422 HQ: standard for editing and grading. "
+              "ProRes 4444: full chroma resolution, largest files. Audio is not included."),
     "rife": "Path to rife-ncnn-vulkan.exe. Found automatically when it sits next to this program.",
     "download": "Download the latest rife-ncnn-vulkan for Windows from GitHub (nihui/rife-ncnn-vulkan) and set it up. A few hundred MB.",
-    "model": "RIFE model. rife-v4.6 is the newest and usually the best. The older models are there for comparison.",
+    "model": "RIFE model. rife-v4.6 is the newest and usually the best. A v4 model is needed to fill gaps of more than one frame.",
     "ffmpeg": "Path to ffmpeg.exe. ffprobe.exe must be in the same folder. Found automatically on PATH or in the WinGet install folder.",
     "browse": "Choose the file or folder.",
-    "period": "Leave blank to detect the cadence automatically. Type a number to force a known period, e.g. 24.",
-    "threshold": "How many times larger than the surrounding motion a frame step must be to count as a clear gap. Default 1.5.",
-    "strength": ("How consistent the gap pattern must be before rendering is allowed. Lower it if a real cadence is "
-                 "rejected, raise it to avoid false detections. Default 1.3."),
-    "snap": "How many frames a gap may move away from the strict grid. 1 lets tracking follow slow drift, 0 locks it to the grid.",
-    "cut": ("A gap where the step is this many times larger than normal is treated as a scene cut and filled with a copy of "
-            "the previous frame instead of an interpolated one. Default 8."),
-    "spikes": ("Off: fill every grid position, including still shots where the gap can't be seen, so timing stays even.\n"
-               "On: fill only where a clear jump is measured."),
-    "force": "Render even if the cadence looks weak. Use together with a fixed period if detection fails.",
-    "csv": "Save a per-frame report (difference, ratio, gap) next to the clip, for checking against your difference layer in Resolve.",
-    "analyze": "Detect the cadence and list the gaps without rendering anything.",
-    "render": "Analyze and render each clip to ProRes with the gaps filled.",
+    "gap_ratio": ("How much longer than expected a frame step must be to count as a gap. 2.0 means exactly one "
+                  "frame missing; the default 1.5 sits halfway. Lower finds more but risks false hits."),
+    "min_conf": ("Events with at least this confidence (0-1) are ticked automatically. The rest are listed "
+                 "unticked for you to check. Default 0.5."),
+    "max_insert": "Longest gap that is filled, in frames. Longer gaps are listed but left alone: interpolation over many frames rarely looks right.",
+    "repeats": "Find repeated frames (a frame shown twice) and drop them. Only judged where there is motion on both sides; in a still shot a repeat is invisible.",
+    "periodic": ("Look for a regular pattern, e.g. one frame missing every 24 in AI video. When one is found, "
+                 "borderline steps on the grid are accepted too."),
+    "fill_static": "On a periodic grid, also insert frames in still shots, where the gap can't be measured, so the timing stays even.",
+    "period": "Leave blank to detect the pattern automatically. Type a number to force a known period, e.g. 24.",
+    "analyze": ("Measure motion in every clip and list the events. Changing the detection settings and clicking "
+                "Analyze again reuses the measurements, so it is instant."),
+    "render": "Render every clip with the ticked events: repeats dropped, missing frames interpolated, ProRes at an even cadence. Clips not yet analysed are analysed first.",
     "cancel": "Stop the current job. A half-written output file is deleted.",
     "log": "Results and progress for each clip.",
+    "timeline": ("Motion of each frame step compared with what was expected (1 = normal). Orange marks: missing frames. "
+                 "Blue marks: repeated frames. Grey: cuts. The dashed line is the gap threshold. Click to jump to the nearest event."),
+    "events": ("Events in the selected clip. Click the first column to tick or untick an event; ticked events are "
+               "applied when rendering. Select a row to see the frames around it. Space toggles the selected rows."),
+    "all": "Tick every missing-frame and repeat event in this clip.",
+    "none": "Untick every event in this clip.",
+    "auto": "Tick events at or above the auto-apply confidence, untick the rest.",
+    "thumbs": ("Frames around the selected event, in source order. For a gap, motion jumps between the middle and right "
+               "frames. For a repeat, the middle frame is the same as the left one."),
 }
 
 
@@ -347,17 +366,39 @@ def tip(widget, key):
     return widget
 
 
-# ------------------------------------------------------------------ app
+def extra_theme(root):
+    st = ttk.Style(root)
+    st.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT,
+                 bordercolor=SEP, lightcolor=PANEL, darkcolor=PANEL, rowheight=20, font=FONT)
+    st.map("Treeview", background=[("selected", "#3A2A18")], foreground=[("selected", TEXT)])
+    st.configure("Treeview.Heading", background=BG, foreground=DIM, bordercolor=SEP,
+                 lightcolor=BG, darkcolor=BG, relief="flat", font=FONT_B, padding=(4, 3))
+    st.map("Treeview.Heading", background=[("active", HOVER)], foreground=[("active", TEXT)])
+    st.configure("Small.TButton", padding=(8, 1))
+    st.configure("Clip.TLabel", foreground=TEXT, font=FONT_B)
+
+
+def png_photo(arr):
+    """numpy RGB -> tk.PhotoImage without ImageTk."""
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, format="PNG")
+    return tk.PhotoImage(data=base64.b64encode(buf.getvalue()).decode("ascii"))
+
 
 class App:
     def __init__(self, root):
         self.root = root
         root.title(f"RIFE Gapfill  v{GUI_VERSION}")
-        root.minsize(800, 760)
+        root.minsize(1240, 820)
         self.q = queue.Queue()
         self.worker = None
         self.cancel_flag = threading.Event()
         self.files = []
+        self.results = {}          # path -> analysis
+        self.current = None        # path shown in the review panel
+        self.sel_event = None
+        self.thumb_token = 0
+        self.thumb_imgs = []
 
         s = self.load_settings()
         rife = s.get("rife") or ""
@@ -368,18 +409,21 @@ class App:
         self.v_model = tk.StringVar(value=s.get("model", "rife-v4.6"))
         self.v_outmode = tk.StringVar(value=s.get("outmode", "source"))
         self.v_outdir = tk.StringVar(value=s.get("outdir", ""))
-        self.v_fps = tk.StringVar(value=s.get("fps", "Same as source (longer clip)"))
-        self.v_fps_custom = tk.StringVar(value=s.get("fps_custom", "24"))
+        fps = s.get("fps2", "Same as source (even cadence)")
+        self.v_fps = tk.StringVar(value=fps if fps in FPS_CHOICES else "Same as source (even cadence)")
+        self.v_fps_custom = tk.StringVar(value=s.get("fps_custom", "25"))
         self.v_prores = tk.StringVar(value=s.get("prores", "ProRes 422 HQ"))
-        self.v_spikes = tk.BooleanVar(value=s.get("spikes_only", False))
-        self.v_csv = tk.BooleanVar(value=s.get("csv", False))
+        self.v_gap = tk.StringVar(value=str(s.get("gap_ratio", 1.5)))
+        self.v_minconf = tk.StringVar(value=str(s.get("min_conf", 0.5)))
+        self.v_maxins = tk.StringVar(value=str(s.get("max_insert", 3)))
+        self.v_repeats = tk.BooleanVar(value=s.get("repeats", True))
+        self.v_periodic = tk.BooleanVar(value=s.get("periodic", True))
+        self.v_fillstatic = tk.BooleanVar(value=s.get("fill_static", True))
         self.v_period = tk.StringVar(value="")
-        self.v_threshold = tk.StringVar(value=str(s.get("threshold", 1.5)))
-        self.v_strength = tk.StringVar(value=str(s.get("min_strength", 1.3)))
-        self.v_snap = tk.StringVar(value=str(s.get("snap", 1)))
-        self.v_cut = tk.StringVar(value=str(s.get("cut_ratio", 8.0)))
-        self.v_force = tk.BooleanVar(value=False)
         self.v_status = tk.StringVar(value="READY")
+        self.v_clip = tk.StringVar(value="No clip selected")
+        self.v_summary = tk.StringVar(value="Add clips and click Analyze.")
+        self.v_count = tk.StringVar(value="")
 
         self.build()
         self.refresh_models()
@@ -389,116 +433,125 @@ class App:
             self.root.after(400, lambda: self.offer_rife_download(startup=True))
 
     # ------------------------------------------------------------- layout
-    def section(self, parent, row, title):
+    def section(self, parent, row, title, col=0):
         hdr = ttk.Frame(parent)
-        hdr.grid(row=row, column=0, sticky="ew", pady=(10, 4))
+        hdr.grid(row=row, column=col, sticky="ew", pady=(10, 4))
         hdr.columnconfigure(1, weight=1)
         ttk.Label(hdr, text=title.upper(), style="Section.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Frame(hdr, style="Sep.TFrame", height=1).grid(row=0, column=1, sticky="ew", padx=(8, 0))
         body = ttk.Frame(parent)
-        body.grid(row=row + 1, column=0, sticky="nsew", padx=(2, 0))
+        body.grid(row=row + 1, column=col, sticky="nsew", padx=(2, 0))
         return body
 
     def build(self):
         global _help_bar
         main = ttk.Frame(self.root, padding=(14, 10, 14, 12))
         main.pack(fill="both", expand=True)
-        main.columnconfigure(0, weight=1)
-        _help_bar = self.help = HelpBar(main)
+        main.columnconfigure(0, weight=0, minsize=470)
+        main.columnconfigure(1, weight=1)
+        main.rowconfigure(1, weight=1)
 
-        # header bar
+        # header
         top = ttk.Frame(main)
-        top.grid(row=0, column=0, sticky="ew")
+        top.grid(row=0, column=0, columnspan=2, sticky="ew")
         top.columnconfigure(2, weight=1)
         ttk.Label(top, text="RIFE GAPFILL", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(top, text=f"  v{GUI_VERSION} · core v{core.VERSION}", style="Ver.TLabel").grid(
             row=0, column=1, sticky="sw", pady=(0, 2))
         ttk.Label(top, textvariable=self.v_status, style="Status.TLabel").grid(row=0, column=3, sticky="e")
 
+        left = ttk.Frame(main)
+        left.grid(row=1, column=0, sticky="nsew", padx=(0, 18))
+        left.columnconfigure(0, weight=1)
+        _help_bar = self.help = HelpBar(left)
+        right = ttk.Frame(main)
+        right.grid(row=1, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+
+        self.build_left(left)
+        self.build_right(right)
+        self.mono_fields(main)
+
+    def build_left(self, left):
         # source clips
-        ff = self.section(main, 1, "Source clips")
+        ff = self.section(left, 0, "Source clips")
         ff.columnconfigure(0, weight=1)
-        lbf = tk.Frame(ff, bg=PANEL, highlightthickness=1, highlightbackground=SEP, highlightcolor=ACCENT)
+        lbf = tk.Frame(ff, bg=PANEL, highlightthickness=1, highlightbackground=SEP)
         lbf.grid(row=0, column=0, rowspan=3, sticky="nsew")
         lbf.columnconfigure(0, weight=1)
         self.lb = tk.Listbox(lbf, height=5, selectmode="extended", bg=PANEL, fg=TEXT,
                              selectbackground=ACCENT, selectforeground="#111111",
                              highlightthickness=0, borderwidth=0, activestyle="none",
-                             font=FONT)
+                             font=FONT, exportselection=False)
         self.lb.grid(row=0, column=0, sticky="nsew", padx=4, pady=3)
         sb = ttk.Scrollbar(lbf, orient="vertical", command=self.lb.yview)
         sb.grid(row=0, column=1, sticky="ns")
         self.lb.configure(yscrollcommand=sb.set)
+        self.lb.bind("<<ListboxSelect>>", lambda e: self.on_clip_select())
         tip(self.lb, "files")
         tip(ttk.Button(ff, text="Add…", command=self.add_files), "add").grid(row=0, column=1, sticky="ew", padx=(8, 0))
         tip(ttk.Button(ff, text="Remove", command=self.remove_files), "remove").grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=3)
         tip(ttk.Button(ff, text="Clear", command=self.clear_files), "clear").grid(row=2, column=1, sticky="new", padx=(8, 0))
 
         # output
-        of = self.section(main, 3, "Output")
+        of = self.section(left, 2, "Output")
         of.columnconfigure(3, weight=1)
         tip(ttk.Radiobutton(of, text="Next to source", variable=self.v_outmode, value="source"),
             "out_source").grid(row=0, column=0, columnspan=2, sticky="w")
         tip(ttk.Radiobutton(of, text="Folder", variable=self.v_outmode, value="folder"),
-            "out_folder").grid(row=0, column=2, sticky="w", padx=(18, 6))
-        tip(ttk.Entry(of, textvariable=self.v_outdir), "outdir").grid(row=0, column=3, sticky="ew")
-        tip(ttk.Button(of, text="Browse…", command=self.pick_outdir), "browse").grid(row=0, column=4, padx=(6, 0))
-
+            "out_folder").grid(row=0, column=2, sticky="w", padx=(14, 6))
+        tip(ttk.Entry(of, textvariable=self.v_outdir, width=10), "outdir").grid(row=0, column=3, sticky="ew")
+        tip(ttk.Button(of, text="…", width=3, command=self.pick_outdir), "browse").grid(row=0, column=4, padx=(6, 0))
         ttk.Label(of, text="Frame rate", style="Dim.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
         cb = tip(ttk.Combobox(of, textvariable=self.v_fps, values=list(FPS_CHOICES),
-                              state="readonly", width=30), "fps")
-        cb.grid(row=1, column=1, columnspan=2, sticky="w", pady=(8, 0), padx=(10, 0))
+                              state="readonly", width=29), "fps")
+        cb.grid(row=1, column=1, columnspan=3, sticky="w", pady=(8, 0), padx=(10, 0))
         cb.bind("<<ComboboxSelected>>", lambda e: self.update_custom())
-        self.e_custom = tip(ttk.Entry(of, textvariable=self.v_fps_custom, width=8), "fps_custom")
-        self.e_custom.grid(row=1, column=3, sticky="w", pady=(8, 0), padx=(8, 0))
+        self.e_custom = tip(ttk.Entry(of, textvariable=self.v_fps_custom, width=7), "fps_custom")
+        self.e_custom.grid(row=1, column=4, sticky="e", pady=(8, 0), padx=(6, 0))
         self.update_custom()
-
         ttk.Label(of, text="Codec", style="Dim.TLabel").grid(row=2, column=0, sticky="w", pady=(4, 0))
         tip(ttk.Combobox(of, textvariable=self.v_prores, values=list(PRORES_CHOICES),
-                         state="readonly", width=30), "codec").grid(
-            row=2, column=1, columnspan=2, sticky="w", pady=(4, 0), padx=(10, 0))
-        ttk.Label(of, text="no audio", style="Ver.TLabel").grid(row=2, column=3, sticky="w", padx=(8, 0), pady=(4, 0))
+                         state="readonly", width=29), "codec").grid(
+            row=2, column=1, columnspan=3, sticky="w", pady=(4, 0), padx=(10, 0))
 
         # tools
-        tf = self.section(main, 5, "Tools")
+        tf = self.section(left, 4, "Tools")
         tf.columnconfigure(1, weight=1)
         ttk.Label(tf, text="RIFE", style="Dim.TLabel").grid(row=0, column=0, sticky="w")
-        tip(ttk.Entry(tf, textvariable=self.v_rife), "rife").grid(row=0, column=1, sticky="ew", padx=(10, 0))
-        tip(ttk.Button(tf, text="Browse…", command=self.pick_rife), "browse").grid(row=0, column=2, padx=(6, 0))
+        tip(ttk.Entry(tf, textvariable=self.v_rife, width=10), "rife").grid(row=0, column=1, sticky="ew", padx=(10, 0))
+        tip(ttk.Button(tf, text="…", width=3, command=self.pick_rife), "browse").grid(row=0, column=2, padx=(6, 0))
         self.b_dl = tip(ttk.Button(tf, text="Download…", command=self.offer_rife_download), "download")
         self.b_dl.grid(row=0, column=3, padx=(6, 0))
         ttk.Label(tf, text="Model", style="Dim.TLabel").grid(row=1, column=0, sticky="w", pady=4)
-        self.cb_model = tip(ttk.Combobox(tf, textvariable=self.v_model, width=18), "model")
+        self.cb_model = tip(ttk.Combobox(tf, textvariable=self.v_model, width=16), "model")
         self.cb_model.grid(row=1, column=1, sticky="w", padx=(10, 0), pady=4)
         ttk.Label(tf, text="ffmpeg", style="Dim.TLabel").grid(row=2, column=0, sticky="w")
-        tip(ttk.Entry(tf, textvariable=self.v_ffmpeg), "ffmpeg").grid(row=2, column=1, sticky="ew", padx=(10, 0))
-        tip(ttk.Button(tf, text="Browse…", command=self.pick_ffmpeg), "browse").grid(row=2, column=2, padx=(6, 0))
+        tip(ttk.Entry(tf, textvariable=self.v_ffmpeg, width=10), "ffmpeg").grid(row=2, column=1, sticky="ew", padx=(10, 0))
+        tip(ttk.Button(tf, text="…", width=3, command=self.pick_ffmpeg), "browse").grid(row=2, column=2, padx=(6, 0))
 
         # detection
-        df = self.section(main, 7, "Detection")
-        fields = [("Period", self.v_period, "period", "auto"),
-                  ("Spike threshold", self.v_threshold, "threshold", "×"),
-                  ("Min strength", self.v_strength, "strength", "×"),
-                  ("Drift snap", self.v_snap, "snap", "fr"),
-                  ("Scene-cut ratio", self.v_cut, "cut", "×")]
+        df = self.section(left, 6, "Detection")
+        fields = [("Gap threshold", self.v_gap, "gap_ratio", "×"),
+                  ("Auto-apply from", self.v_minconf, "min_conf", "conf"),
+                  ("Fill gaps up to", self.v_maxins, "max_insert", "frames"),
+                  ("Period", self.v_period, "period", "auto")]
         for k, (lab, var, key, unit) in enumerate(fields):
-            r, c = divmod(k, 3)
+            r, c = divmod(k, 2)
             tip(ttk.Label(df, text=lab, style="Dim.TLabel"), key).grid(
-                row=r, column=c * 3, sticky="w", padx=(0 if c == 0 else 22, 8), pady=2)
-            tip(ttk.Entry(df, textvariable=var, width=6), key).grid(row=r, column=c * 3 + 1, sticky="w", pady=2)
+                row=r, column=c * 3, sticky="w", padx=(0 if c == 0 else 18, 8), pady=2)
+            tip(ttk.Entry(df, textvariable=var, width=5), key).grid(row=r, column=c * 3 + 1, sticky="w", pady=2)
             ttk.Label(df, text=unit, style="Ver.TLabel").grid(row=r, column=c * 3 + 2, sticky="w", padx=(4, 0))
         chk = ttk.Frame(df)
-        chk.grid(row=2, column=0, columnspan=9, sticky="w", pady=(6, 0))
-        tip(ttk.Checkbutton(chk, text="Only fill clear spikes", variable=self.v_spikes), "spikes").pack(side="left")
-        tip(ttk.Checkbutton(chk, text="Force", variable=self.v_force), "force").pack(side="left", padx=(22, 0))
-        tip(ttk.Checkbutton(chk, text="Write analysis CSV", variable=self.v_csv), "csv").pack(side="left", padx=(22, 0))
+        chk.grid(row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        tip(ttk.Checkbutton(chk, text="Repeats", variable=self.v_repeats), "repeats").pack(side="left")
+        tip(ttk.Checkbutton(chk, text="Periodic grid", variable=self.v_periodic), "periodic").pack(side="left", padx=(16, 0))
+        tip(ttk.Checkbutton(chk, text="Fill stills", variable=self.v_fillstatic), "fill_static").pack(side="left", padx=(16, 0))
 
-        # help panel
-        self.help.frame.grid(row=9, column=0, sticky="ew", pady=(14, 0))
-
-        # actions
-        af = ttk.Frame(main)
-        af.grid(row=10, column=0, sticky="ew", pady=(12, 6))
+        # help + actions
+        self.help.frame.grid(row=8, column=0, sticky="ew", pady=(14, 0))
+        af = ttk.Frame(left)
+        af.grid(row=9, column=0, sticky="ew", pady=(12, 0))
         af.columnconfigure(3, weight=1)
         self.b_an = tip(ttk.Button(af, text="Analyze", command=lambda: self.start(False)), "analyze")
         self.b_an.grid(row=0, column=0)
@@ -509,14 +562,11 @@ class App:
         self.b_cancel.grid(row=0, column=2)
         self.pb = ttk.Progressbar(af, mode="determinate")
         self.pb.grid(row=0, column=3, sticky="ew", padx=(12, 0))
-
-        # log
-        lf = tk.Frame(main, bg=PANEL, highlightthickness=1, highlightbackground=SEP)
-        lf.grid(row=11, column=0, sticky="nsew")
-        lf.columnconfigure(0, weight=1)
+        lf = tk.Frame(left, bg=PANEL, highlightthickness=1, highlightbackground=SEP)
+        lf.grid(row=10, column=0, sticky="nsew", pady=(12, 0))
         lf.rowconfigure(0, weight=1)
-        main.rowconfigure(11, weight=1)
-        self.log = tk.Text(lf, height=11, bg=PANEL, fg=TEXT, insertbackground=TEXT,
+        lf.columnconfigure(0, weight=1)
+        self.log = tk.Text(lf, height=7, width=40, bg=PANEL, fg=TEXT, insertbackground=TEXT,
                            selectbackground=TRACK, selectforeground=TEXT, borderwidth=0,
                            highlightthickness=0, font=FONT, padx=8, pady=6, wrap="word",
                            state="disabled")
@@ -529,7 +579,85 @@ class App:
         self.log.tag_configure("head", foreground=TEXT, font=FONT_B)
         self.log.tag_configure("dim", foreground=DIM)
         tip(self.log, "log")
-        self.mono_fields(main)
+        left.rowconfigure(10, weight=1)
+
+    def build_right(self, right):
+        rv = self.section(right, 0, "Review")
+        rv.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+
+        hdr = ttk.Frame(rv)
+        hdr.grid(row=0, column=0, sticky="ew")
+        hdr.columnconfigure(0, weight=1)
+        ttk.Label(hdr, textvariable=self.v_clip, style="Clip.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(hdr, textvariable=self.v_count, style="Dim.TLabel").grid(row=0, column=1, sticky="e")
+        ttk.Label(rv, textvariable=self.v_summary, style="Dim.TLabel", justify="left").grid(
+            row=1, column=0, sticky="w", pady=(2, 6))
+
+        cf = tk.Frame(rv, bg=PANEL, highlightthickness=1, highlightbackground=SEP)
+        cf.grid(row=2, column=0, sticky="ew")
+        self.canvas = tk.Canvas(cf, height=120, bg=PANEL, highlightthickness=0, borderwidth=0,
+                                cursor="hand2")
+        self.canvas.pack(fill="x", expand=True)
+        self.canvas.bind("<Configure>", lambda e: self.draw_timeline())
+        self.canvas.bind("<Button-1>", self.on_canvas_click)
+        tip(self.canvas, "timeline")
+
+        tf = tk.Frame(rv, bg=PANEL, highlightthickness=1, highlightbackground=SEP)
+        tf.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        rv.rowconfigure(3, weight=1)
+        tf.columnconfigure(0, weight=1)
+        tf.rowconfigure(0, weight=1)
+        cols = ("on", "frame", "tc", "type", "conf", "note")
+        self.tree = ttk.Treeview(tf, columns=cols, show="headings", selectmode="extended", height=14)
+        for c, txt, w, anc in (("on", "", 34, "center"), ("frame", "FRAME", 62, "e"),
+                               ("tc", "TIMECODE", 100, "w"), ("type", "TYPE", 110, "w"),
+                               ("conf", "CONF", 52, "e"), ("note", "NOTE", 300, "w")):
+            self.tree.heading(c, text=txt)
+            self.tree.column(c, width=w, minwidth=w if c != "note" else 120, anchor=anc,
+                             stretch=(c == "note"))
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        tsb = ttk.Scrollbar(tf, orient="vertical", command=self.tree.yview)
+        tsb.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=tsb.set)
+        self.tree.tag_configure("off", foreground=DIM)
+        self.tree.tag_configure("cut", foreground=DIMMER)
+        self.tree.tag_configure("rep", foreground=REPEAT)
+        self.tree.bind("<Button-1>", self.on_tree_click, add="+")
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self.on_event_select())
+        self.tree.bind("<space>", lambda e: (self.toggle_selected(), "break")[1])
+        tip(self.tree, "events")
+
+        bf = ttk.Frame(rv)
+        bf.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        self.b_all = tip(ttk.Button(bf, text="Tick all", style="Small.TButton",
+                                    command=lambda: self.set_ticks("all")), "all")
+        self.b_all.pack(side="left")
+        self.b_none = tip(ttk.Button(bf, text="Untick all", style="Small.TButton",
+                                     command=lambda: self.set_ticks("none")), "none")
+        self.b_none.pack(side="left", padx=6)
+        self.b_auto = tip(ttk.Button(bf, text="Tick by confidence", style="Small.TButton",
+                                     command=lambda: self.set_ticks("auto")), "auto")
+        self.b_auto.pack(side="left")
+
+        th = ttk.Frame(rv)
+        th.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        self.thumb_labels, self.thumb_caps = [], []
+        for k in range(3):
+            fr = tk.Frame(th, bg=PANEL, highlightthickness=1, highlightbackground=SEP)
+            fr.grid(row=0, column=k, padx=(0 if k == 0 else 8, 0), sticky="nw")
+            lab = tk.Label(fr, bg=PANEL, width=THUMB_W, height=int(THUMB_W * 9 / 16),
+                           bd=0, highlightthickness=0)
+            img = tk.PhotoImage(width=THUMB_W, height=int(THUMB_W * 9 / 16))
+            lab.configure(image=img)
+            lab.image = img
+            lab.pack()
+            cap = tk.Label(fr, text="", bg=PANEL, fg=DIM, font=FONT, anchor="w", padx=6, pady=2)
+            cap.pack(fill="x")
+            tip(lab, "thumbs")
+            self.thumb_labels.append(lab)
+            self.thumb_caps.append(cap)
+
 
     def mono_fields(self, w):
         """ttk Entry/Combobox ignore the style font; set it per widget."""
@@ -537,6 +665,223 @@ class App:
             if isinstance(c, (ttk.Entry, ttk.Combobox)):
                 c.configure(font=FONT)
             self.mono_fields(c)
+
+    # ------------------------------------------------------------ review
+    def an(self):
+        return self.results.get(self.current) if self.current else None
+
+    def on_clip_select(self):
+        sel = self.lb.curselection()
+        if not sel:
+            return
+        self.current = self.files[sel[0]]
+        self.show_review()
+
+    def show_review(self):
+        an = self.an()
+        self.tree.delete(*self.tree.get_children())
+        self.sel_event = None
+        self.clear_thumbs()
+        if not self.current:
+            self.v_clip.set("No clip selected")
+            self.v_summary.set("Add clips and click Analyze.")
+            self.v_count.set("")
+        elif not an:
+            self.v_clip.set(os.path.basename(self.current))
+            self.v_summary.set("Not analysed yet. Click Analyze.")
+            self.v_count.set("")
+        else:
+            self.v_clip.set(os.path.basename(self.current))
+            for idx, e in enumerate(an["events"]):
+                self.tree.insert("", "end", iid=str(idx), values=self.row_values(an, e),
+                                 tags=self.row_tags(e))
+            self.update_summary()
+        self.draw_timeline()
+
+    def row_values(self, an, e):
+        on = "" if e.kind in ("cut",) else ("[x]" if e.apply else "[ ]")
+        tc = core.frames_to_tc(e.frame, an["fps"], an["info"].get("timecode"))
+        conf = "" if e.kind == "cut" else f"{e.conf:.2f}"
+        note = e.note + ("  [grid]" if e.grid else "")
+        return (on, e.frame, tc, e.label(), conf, note)
+
+    def row_tags(self, e):
+        if e.kind == "cut" or e.kind == "long":
+            return ("cut",)
+        if not e.apply:
+            return ("off",)
+        return ("rep",) if e.kind == "repeat" else ()
+
+    def update_summary(self):
+        an = self.an()
+        if not an:
+            return
+        ev = an["events"]
+        on = [e for e in ev if e.apply]
+        ins = sum(e.count for e in on if e.kind == "missing")
+        rep = sum(1 for e in on if e.kind == "repeat")
+        self.v_summary.set(core.summary(an).replace("\n  ", "\n"))
+        self.v_count.set(f"{an['n']} -> {core.out_count(an)} frames   +{ins} interpolated  -{rep} repeats")
+
+    def refresh_row(self, idx):
+        an = self.an()
+        e = an["events"][idx]
+        self.tree.item(str(idx), values=self.row_values(an, e), tags=self.row_tags(e))
+
+    def on_tree_click(self, ev):
+        if self.tree.identify_region(ev.x, ev.y) != "cell":
+            return
+        if self.tree.identify_column(ev.x) != "#1":
+            return
+        row = self.tree.identify_row(ev.y)
+        if row:
+            self.toggle([int(row)])
+            return "break"
+
+    def toggle_selected(self):
+        self.toggle([int(i) for i in self.tree.selection()])
+
+    def toggle(self, idxs):
+        an = self.an()
+        if not an or (self.worker and self.worker.is_alive()):
+            return
+        for i in idxs:
+            e = an["events"][i]
+            if e.kind in ("missing", "repeat"):
+                e.apply = not e.apply
+                self.refresh_row(i)
+        self.update_summary()
+        self.draw_timeline()
+
+    def set_ticks(self, mode):
+        an = self.an()
+        if not an or (self.worker and self.worker.is_alive()):
+            return
+        try:
+            mc = float(self.v_minconf.get())
+        except ValueError:
+            mc = 0.5
+        for i, e in enumerate(an["events"]):
+            if e.kind not in ("missing", "repeat"):
+                continue
+            e.apply = mode == "all" or (mode == "auto" and e.conf >= mc)
+            self.refresh_row(i)
+        self.update_summary()
+        self.draw_timeline()
+
+    def on_event_select(self):
+        sel = self.tree.selection()
+        an = self.an()
+        if not sel or not an:
+            return
+        self.sel_event = int(sel[0])
+        self.draw_timeline()
+        self.load_thumbs(an, an["events"][self.sel_event])
+
+    def select_event(self, idx):
+        self.tree.selection_set(str(idx))
+        self.tree.focus(str(idx))
+        def centre():
+            kids = self.tree.get_children()
+            if kids:
+                self.tree.yview_moveto(max(0.0, (idx - 6) / len(kids)))
+        self.root.after_idle(centre)
+
+    # timeline -------------------------------------------------------
+    def tl_geom(self):
+        w = max(self.canvas.winfo_width(), 100)
+        h = max(self.canvas.winfo_height(), 60)
+        return w, h, 10, 10
+
+    def draw_timeline(self):
+        c = self.canvas
+        c.delete("all")
+        an = self.an()
+        w, h, px, py = self.tl_geom()
+        if not an:
+            c.create_text(w // 2, h // 2, text="Motion timeline appears here after analysis",
+                          fill=DIMMER, font=FONT)
+            return
+        n = max(an["n"], 2)
+        top, bot = py + 14, h - py
+        ymax = 4.0
+
+        def X(i):
+            return px + (w - 2 * px) * i / (n - 1)
+
+        def Y(r):
+            return bot - (bot - top) * min(r, ymax) / ymax
+
+        c.create_line(px, Y(1.0), w - px, Y(1.0), fill=SEP)
+        try:
+            thr = float(self.v_gap.get())
+        except ValueError:
+            thr = 1.5
+        c.create_line(px, Y(thr), w - px, Y(thr), fill=DIMMER, dash=(3, 3))
+        c.create_text(w - px, Y(thr) - 7, text=f"{thr:g}x", fill=DIMMER, font=(FONT_FAMILY, 7), anchor="e")
+
+        ratio, judge = an["stats"]["ratio"], an["stats"]["judge"]
+        cols = int(w - 2 * px)
+        per = n / max(cols, 1)
+        for xcol in range(cols):
+            a, b = int(xcol * per), int((xcol + 1) * per) + 1
+            seg = [ratio[i] for i in range(max(1, a), min(n, b)) if judge[i]]
+            if not seg:
+                continue
+            r = max(seg)
+            c.create_line(px + xcol, Y(0), px + xcol, Y(r), fill=TRACK if r < thr else "#6A5A48")
+
+        for idx, e in enumerate(an["events"]):
+            x = X(e.frame)
+            if e.kind == "missing":
+                col = ACCENT if e.apply else "#7A4A16"
+            elif e.kind == "repeat":
+                col = REPEAT if e.apply else "#24506E"
+            else:
+                col = DIM
+            c.create_line(x, top - 2, x, bot, fill=col, width=1)
+            c.create_polygon(x - 4, py, x + 4, py, x, py + 7, fill=col, outline="")
+            if idx == self.sel_event:
+                c.create_rectangle(x - 5, py - 2, x + 5, bot + 2, outline=TEXT)
+
+    def on_canvas_click(self, ev):
+        an = self.an()
+        if not an or not an["events"]:
+            return
+        w, h, px, py = self.tl_geom()
+        n = max(an["n"], 2)
+        frame = (ev.x - px) / max(w - 2 * px, 1) * (n - 1)
+        idx = min(range(len(an["events"])), key=lambda k: abs(an["events"][k].frame - frame))
+        self.select_event(idx)
+
+    # thumbnails -----------------------------------------------------
+    def clear_thumbs(self):
+        for lab, cap in zip(self.thumb_labels, self.thumb_caps):
+            img = tk.PhotoImage(width=THUMB_W, height=int(THUMB_W * 9 / 16))
+            lab.configure(image=img)
+            lab.image = img
+            cap.configure(text="")
+
+    def load_thumbs(self, an, e):
+        self.thumb_token += 1
+        token = self.thumb_token
+        if e.kind == "missing" or e.kind == "long":
+            frames = [e.frame - 2, e.frame - 1, e.frame]
+            caps = ["before", "last before gap", "first after gap"]
+        else:
+            frames = [e.frame - 1, e.frame, e.frame + 1]
+            caps = ["before", "repeat" if e.kind == "repeat" else "after cut", "after"]
+        ff = self.v_ffmpeg.get().strip() or core.find_tool("ffmpeg")
+        for cap, n, txt in zip(self.thumb_caps, frames, caps):
+            cap.configure(text=f"{n}  {txt}" if 0 <= n < an["n"] else "")
+
+        def work():
+            for k, n in enumerate(frames):
+                if token != self.thumb_token:
+                    return
+                arr = core.extract_frame(an["path"], n, an["fps"], ff, THUMB_W) if 0 <= n < an["n"] else None
+                self.q.put(("thumb", (token, k, arr)))
+        threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------ helpers
     def update_custom(self):
@@ -556,15 +901,26 @@ class App:
             if p not in self.files:
                 self.files.append(p)
                 self.lb.insert("end", p)
+        if self.files and not self.current:
+            self.lb.selection_set(0)
+            self.on_clip_select()
 
     def remove_files(self):
         for i in reversed(self.lb.curselection()):
+            p = self.files[i]
             self.lb.delete(i)
             del self.files[i]
+            self.results.pop(p, None)
+            if p == self.current:
+                self.current = None
+        self.show_review()
 
     def clear_files(self):
         self.lb.delete(0, "end")
         self.files.clear()
+        self.results.clear()
+        self.current = None
+        self.show_review()
 
     def pick_outdir(self):
         d = filedialog.askdirectory()
@@ -593,7 +949,7 @@ class App:
             tag = "ok"
         elif text and not text.startswith(" "):
             tag = "head"
-        elif s.startswith("from ") or s.startswith("CSV:"):
+        elif s.startswith("from ") or s.startswith("CSV:") or s.startswith("periodic"):
             tag = "dim"
         else:
             tag = None
@@ -612,11 +968,11 @@ class App:
     def save_settings(self):
         s = {"rife": self.v_rife.get(), "ffmpeg": self.v_ffmpeg.get(),
              "model": self.v_model.get(), "outmode": self.v_outmode.get(),
-             "outdir": self.v_outdir.get(), "fps": self.v_fps.get(),
+             "outdir": self.v_outdir.get(), "fps2": self.v_fps.get(),
              "fps_custom": self.v_fps_custom.get(), "prores": self.v_prores.get(),
-             "spikes_only": self.v_spikes.get(), "csv": self.v_csv.get(),
-             "threshold": self.v_threshold.get(), "min_strength": self.v_strength.get(),
-             "snap": self.v_snap.get(), "cut_ratio": self.v_cut.get()}
+             "gap_ratio": self.v_gap.get(), "min_conf": self.v_minconf.get(),
+             "max_insert": self.v_maxins.get(), "repeats": self.v_repeats.get(),
+             "periodic": self.v_periodic.get(), "fill_static": self.v_fillstatic.get()}
         try:
             with open(settings_path(), "w") as f:
                 json.dump(s, f, indent=2)
@@ -633,11 +989,10 @@ class App:
             ffmpeg=self.v_ffmpeg.get().strip(), ffprobe="", rife=self.v_rife.get().strip(),
             model=self.v_model.get().strip() or "rife-v4.6",
             prores=PRORES_CHOICES[self.v_prores.get()], out_fps=mode,
-            period=int(period) if period else None,
-            threshold=float(self.v_threshold.get()),
-            min_strength=float(self.v_strength.get()),
-            snap=int(self.v_snap.get()), cut_ratio=float(self.v_cut.get()),
-            spikes_only=self.v_spikes.get(), force=self.v_force.get())
+            gap_ratio=float(self.v_gap.get()), min_conf=float(self.v_minconf.get()),
+            max_insert=int(self.v_maxins.get()), detect_repeats=self.v_repeats.get(),
+            periodic=self.v_periodic.get(), fill_static=self.v_fillstatic.get(),
+            period=int(period) if period else None)
 
     # ------------------------------------------------------------- worker
     def start(self, do_render):
@@ -656,30 +1011,35 @@ class App:
         self.cancel_flag.clear()
         self.set_busy(True)
         outdir = self.v_outdir.get() if self.v_outmode.get() == "folder" else None
-        args = (list(self.files), opt, do_render, outdir, self.v_csv.get())
+        args = (list(self.files), opt, do_render, outdir)
         self.worker = threading.Thread(target=self.run_jobs, args=args, daemon=True)
         self.worker.start()
 
-    def run_jobs(self, files, opt, do_render, outdir, want_csv):
+    def run_jobs(self, files, opt, do_render, outdir):
         log = lambda t: self.q.put(("log", t))
         cancel = self.cancel_flag.is_set
+        prog = lambda i, t: self.q.put(("progress", (i, t)))
         n = len(files)
         for k, path in enumerate(files, 1):
-            self.q.put(("status", f"{'RENDERING' if do_render else 'ANALYSING'} {k}/{n}"))
             self.q.put(("progress", (0, 1)))
             try:
-                an = core.analyze(path, opt, log=log, cancel=cancel)
-                if want_csv:
-                    p = os.path.splitext(path)[0] + "_analysis.csv"
-                    if outdir:
-                        p = os.path.join(outdir, os.path.basename(p))
-                    core.write_csv(an, p)
-                    log(f"  CSV: {p}")
-                if do_render and an["ok"]:
+                an = self.results.get(path)
+                if not do_render or an is None:
+                    self.q.put(("status", f"ANALYSING {k}/{n}"))
+                    if an is not None:
+                        core.resolve_tools(opt)
+                        events, stats = core.classify(an["m"], opt, an["fps"])
+                        an = dict(an, events=events, stats=stats)
+                        log(os.path.basename(path))
+                        log("  re-classified from saved measurements")
+                        log("  " + core.summary(an))
+                    else:
+                        an = core.analyze(path, opt, log=log, cancel=cancel, progress=prog)
+                    self.q.put(("analysed", (path, an)))
+                if do_render:
+                    self.q.put(("status", f"RENDERING {k}/{n}"))
                     out = core.default_output(path, core.out_fps_for(an, opt), outdir)
-                    core.render(an, out, opt, log=log,
-                                progress=lambda i, t: self.q.put(("progress", (i, t))),
-                                cancel=cancel)
+                    core.render(an, out, opt, log=log, progress=prog, cancel=cancel)
                     log(f"  done: {out}")
             except core.Cancelled:
                 log("  cancelled")
@@ -717,7 +1077,7 @@ class App:
         except Exception as e:
             log(f"  ERROR: download failed: {e}")
             log("  You can download it manually from "
-                "github.com/nihui/rife-ncnn-vulkan/releases and use Browse…")
+                "github.com/nihui/rife-ncnn-vulkan/releases and use the … button")
         log("")
         self.q.put(("done", None))
 
@@ -727,9 +1087,8 @@ class App:
 
     def set_busy(self, busy):
         st = "disabled" if busy else "normal"
-        self.b_an.configure(state=st)
-        self.b_go.configure(state=st)
-        self.b_dl.configure(state=st)
+        for b in (self.b_an, self.b_go, self.b_dl, self.b_all, self.b_none, self.b_auto):
+            b.configure(state=st)
         self.b_cancel.configure(state="normal" if busy else "disabled")
 
     def poll(self):
@@ -744,6 +1103,22 @@ class App:
                     i, t = val
                     self.pb["maximum"] = max(t, 1)
                     self.pb["value"] = i
+                elif kind == "analysed":
+                    path, an = val
+                    self.results[path] = an
+                    if self.current is None:
+                        self.current = path
+                        if path in self.files:
+                            self.lb.selection_clear(0, "end")
+                            self.lb.selection_set(self.files.index(path))
+                    if path == self.current:
+                        self.show_review()
+                elif kind == "thumb":
+                    token, k, arr = val
+                    if token == self.thumb_token and arr is not None:
+                        img = png_photo(arr)
+                        self.thumb_labels[k].configure(image=img)
+                        self.thumb_labels[k].image = img
                 elif kind == "rife":
                     self.v_rife.set(val)
                     self.refresh_models()
@@ -754,7 +1129,7 @@ class App:
                     self.pb["value"] = 0
         except queue.Empty:
             pass
-        self.root.after(100, self.poll)
+        self.root.after(80, self.poll)
 
     def on_close(self):
         if self.worker and self.worker.is_alive():
@@ -769,6 +1144,8 @@ def main():
     set_dpi_awareness()
     root = tk.Tk()
     apply_theme(root)
+    extra_theme(root)
+    root.geometry("1320x880")
     App(root)
     dark_titlebar(root)
     root.mainloop()

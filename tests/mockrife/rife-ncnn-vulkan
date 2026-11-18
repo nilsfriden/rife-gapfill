@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+# Test stand-in for rife-ncnn-vulkan: flow-based interpolation at timestep -s
+import sys, numpy as np, cv2
+a = sys.argv
+f0 = a[a.index("-0") + 1]; f1 = a[a.index("-1") + 1]; o = a[a.index("-o") + 1]
+t = float(a[a.index("-s") + 1]) if "-s" in a else 0.5
+A = cv2.imread(f0); B = cv2.imread(f1)
+ga, gb = cv2.cvtColor(A, cv2.COLOR_BGR2GRAY), cv2.cvtColor(B, cv2.COLOR_BGR2GRAY)
+dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+fl = dis.calc(ga, gb, None)
+h, w = ga.shape
+gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+wa = cv2.remap(A, gx - t * fl[..., 0], gy - t * fl[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+wb = cv2.remap(B, gx + (1 - t) * fl[..., 0], gy + (1 - t) * fl[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+cv2.imwrite(o, ((1 - t) * wa.astype(np.float32) + t * wb.astype(np.float32)).clip(0, 255).astype(np.uint8))

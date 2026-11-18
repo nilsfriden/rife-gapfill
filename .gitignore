@@ -6,3 +6,5 @@ __pycache__/
 rife-ncnn-vulkan*/
 *.mov
 *_analysis.csv
+tests/clips/
+*_events.csv
