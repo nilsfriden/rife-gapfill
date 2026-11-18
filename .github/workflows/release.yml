@@ -1,14 +1,14 @@
-# Builds RifeGapfill-<tag>.exe and publishes a GitHub release.
+# Builds RifeGapfill-<version>.exe and publishes a GitHub release.
 #
-#   git tag v2.2 && git push origin v2.2
+# Start it either way:
+#   - Actions > Release > Run workflow, enter a version such as v2.2
+#     (leave it empty for a test build that is only kept as an artifact)
+#   - git tag v2.2 && git push origin v2.2
 #
 # 1. test:    renders the synthetic test clips and checks detection (Linux)
 # 2. build:   PyInstaller one-file exe (Windows)
-# 3. release: creates the release for the tag, notes from docs/releases/<tag>.md,
-#             exe attached, SHA-256 appended
-#
-# Run it by hand (Actions > Release > Run workflow) to get a test build as a
-# workflow artifact without publishing anything.
+# 3. release: creates the tag and the release, notes from
+#             docs/releases/<version>.md, exe attached, SHA-256 appended
 
 name: Release
 
@@ -16,6 +16,14 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. v2.2 (empty = test build only)"
+        required: false
+        default: ""
+
+env:
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
 
 permissions:
   contents: write
@@ -56,7 +64,8 @@ jobs:
         id: build
         shell: pwsh
         run: |
-          $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "dev-${{ github.run_number }}" }
+          $tag = if ("$env:VERSION") { "$env:VERSION" } else { "dev-${{ github.run_number }}" }
+          if ($tag -notmatch '^(v\d+(\.\d+)*|dev-\d+)$') { throw "version must look like v2.2, got '$tag'" }
           $name = "RifeGapfill-$tag"
           pyinstaller --onefile --windowed --name $name gapfill_gui.py
           if (-not (Test-Path "dist/$name.exe")) { throw "build failed: dist/$name.exe missing" }
@@ -76,7 +85,7 @@ jobs:
 
   release:
     needs: build
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' || inputs.version != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -84,7 +93,9 @@ jobs:
           name: ${{ needs.build.outputs.name }}
       - uses: softprops/action-gh-release@v2
         with:
-          name: RIFE Gapfill ${{ github.ref_name }}
+          tag_name: ${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
+          name: RIFE Gapfill ${{ env.VERSION }}
           body_path: release-notes.md
           files: dist/${{ needs.build.outputs.name }}.exe
           make_latest: true

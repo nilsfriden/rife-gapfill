@@ -144,16 +144,21 @@ python rife_gapfill.py clip.mov --out-fps keep --prores 4444
 
 ## Releases
 
-Releases are built on GitHub. Pushing a version tag runs
-`.github/workflows/release.yml`: the synthetic test clips are rendered and
-checked on Linux, the exe is built with PyInstaller on Windows, and a release
-is published with the notes from `docs/releases/<tag>.md`, the exe and its
-SHA-256.
+Releases are built on GitHub by `.github/workflows/release.yml`: the
+synthetic test clips are rendered and checked on Linux, the exe is built with
+PyInstaller on Windows, and a release is published with the notes from
+`docs/releases/<version>.md`, the exe and its SHA-256.
+
+Start it from **Actions > Release > Run workflow** with a version such as
+`v2.2`, or by pushing a tag:
 
 ```
 git tag v2.2
 git push origin v2.2
 ```
+
+Leave the version empty for a test build that is kept as a workflow artifact
+and not published.
 
 ## Tests
 
